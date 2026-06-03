@@ -1,0 +1,7 @@
+{
+    "skani_db": "/home/ac.cucinell/bvbrc-dev/AnnotationDev/skani_db/bvbrc_ref_sketches",
+    "taxon_map": "/home/ac.cucinell/bvbrc-dev/AnnotationDev/skani_db/genome_taxon_map.tsv",
+    "min_ani": 80.0,
+    "min_af": 30.0,
+    "threads": 8
+}

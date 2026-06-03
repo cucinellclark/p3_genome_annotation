@@ -24,6 +24,35 @@ use IO::File;
 use Module::Metadata;
 use GenomeTypeObject;
 
+#
+# skani organism prediction configuration.
+# Loaded from skani_config.json located next to this script,
+# or override with $SKANI_CONFIG environment variable.
+#
+
+my $skani_config_file = $ENV{SKANI_CONFIG}
+    // dirname(__FILE__) . "/../skani_config.json";
+my $SKANI_CONFIG = {};
+if (-f $skani_config_file)
+{
+    eval {
+	open(my $fh, "<", $skani_config_file) or die "Cannot open $skani_config_file: $!";
+	local $/;
+	my $text = <$fh>;
+	close($fh);
+	$SKANI_CONFIG = JSON::XS::decode_json($text);
+	print STDERR "Loaded skani config from $skani_config_file\n";
+    };
+    if ($@)
+    {
+	warn "Warning: failed to load skani config from $skani_config_file: $@\n";
+    }
+}
+else
+{
+    print STDERR "No skani config found at $skani_config_file; organism prediction disabled\n";
+}
+
 my $script = Bio::KBase::AppService::AppScript->new(\&process_genome, \&preflight);
 
 my $rc = $script->run(\@ARGV);
@@ -103,6 +132,57 @@ sub process_genome
     }
     $params->{taxonomy_id} = $1;
 
+    #
+    # If taxonomy_id was not provided, run skani organism prediction.
+    # We need the contigs downloaded to a local temp file first.
+    #
+    if (!$params->{taxonomy_id} && $SKANI_CONFIG->{skani_db})
+    {
+	print STDERR "No taxonomy_id supplied; running skani organism prediction\n";
+
+	my $skani_temp = File::Temp->new(SUFFIX => '.fasta');
+	my $ws = $app->workspace();
+	$ws->copy_files_to_handles(1, $core->token,
+				   [[$params->{contigs}, $skani_temp]]);
+	close($skani_temp);
+
+	#
+	# Handle gzipped contigs.
+	#
+	my $skani_input = "$skani_temp";
+	open(my $fh_check, "<", $skani_input) or die "Cannot open $skani_input: $!";
+	my $magic;
+	read($fh_check, $magic, 2);
+	close($fh_check);
+	if ($magic eq "\037\213")
+	{
+	    my $gunzip_temp = File::Temp->new(SUFFIX => '.fasta');
+	    IPC::Run::run(["gzip", "-d", "-c", $skani_input],
+			  ">", "$gunzip_temp")
+		or die "Failed to decompress contigs for skani: $!\n";
+	    $skani_input = "$gunzip_temp";
+	}
+
+	my $prediction = run_skani_prediction($skani_input);
+
+	print STDERR sprintf(
+	    "skani prediction: taxon_id=%s name='%s' (ANI=%.2f%%, AF=%.2f%%)\n",
+	    $prediction->{taxonomy_id},
+	    $prediction->{scientific_name},
+	    $prediction->{ani},
+	    $prediction->{af},
+	);
+
+	$params->{taxonomy_id}     = $prediction->{taxonomy_id};
+	$params->{scientific_name} //= $prediction->{scientific_name};
+	$params->{_skani_prediction} = $prediction;
+    }
+    elsif (!$params->{taxonomy_id})
+    {
+	die "No taxonomy_id supplied and skani organism prediction is not configured. " .
+	    "Please supply taxonomy_id.\n";
+    }
+
     my $user_id = $core->user_id;
 
     #
@@ -126,6 +206,16 @@ sub process_genome
     # Construct genome object metadata and create a new genome object.
     #
 
+    #
+    # Ensure we have a scientific_name at this point (either user-supplied
+    # or from skani prediction).
+    #
+    if (!$params->{scientific_name})
+    {
+	die "No scientific_name provided and organism prediction did not produce one. " .
+	    "Please supply scientific_name or omit taxonomy_id to enable prediction.\n";
+    }
+
     my $meta = {
 	scientific_name => $params->{scientific_name},
 	genetic_code => $params->{code},
@@ -133,7 +223,12 @@ sub process_genome
 	($def->{taxon_lineage} ? (ncbi_lineage => $def->{taxon_lineage}) : ()),
 	($params->{taxonomy_id} ? (ncbi_taxonomy_id => $params->{taxonomy_id}) : ()),
 	($user_id ? (owner => $user_id) : ()),
-
+	($params->{_skani_prediction} ? (
+	    organism_prediction_method => "skani",
+	    organism_prediction_ani    => $params->{_skani_prediction}{ani},
+	    organism_prediction_af     => $params->{_skani_prediction}{af},
+	    organism_prediction_ref    => $params->{_skani_prediction}{genome_id},
+	) : ()),
     };
     my $genome = $core->impl->create_genome($meta);
 
@@ -430,4 +525,131 @@ sub run_seedtk_cmd
     local $ENV{PATH} = seedtk . "/bin:$ENV{PATH}";
     my $ok = IPC::Run::run(@cmd);
     $ok or die "Failure $? running seedtk cmd: " . Dumper(\@cmd);
+}
+
+#
+# skani organism prediction subroutines.
+#
+
+sub run_skani_prediction
+{
+    my($contig_file) = @_;
+
+    my $skani_db   = $SKANI_CONFIG->{skani_db}   or die "skani_db not set in skani config\n";
+    my $taxon_map  = $SKANI_CONFIG->{taxon_map}  or die "taxon_map not set in skani config\n";
+    my $min_ani    = $SKANI_CONFIG->{min_ani}    // 80.0;
+    my $min_af     = $SKANI_CONFIG->{min_af}     // 30.0;
+    my $threads    = $SKANI_CONFIG->{threads}    // 8;
+
+    print STDERR "Running skani organism prediction on $contig_file\n";
+    print STDERR "  Database: $skani_db\n";
+    print STDERR "  Thresholds: ANI >= $min_ani%, AF >= $min_af%\n";
+
+    my @cmd = ("skani", "search",
+	       "--qi", $contig_file,
+	       "-d", $skani_db,
+	       "-n", "1",
+	       "-t", $threads);
+
+    my ($out, $err);
+    my $ok = IPC::Run::run(\@cmd, ">", \$out, "2>", \$err);
+
+    if (!$ok)
+    {
+	die "skani search failed: $err\n";
+    }
+
+    print STDERR "skani stderr: $err\n" if $err;
+
+    #
+    # Parse skani output. Tab-separated columns:
+    # Ref_file  Query_file  ANI  Align_fraction_ref  Align_fraction_query  Ref_name  Query_name
+    #
+    my @lines = grep { !/^Ref_file/ && /\S/ } split(/\n/, $out);
+
+    if (!@lines)
+    {
+	die "skani prediction failed: no hits returned. " .
+	    "Please supply taxonomy_id manually.\n";
+    }
+
+    my $top = $lines[0];
+    my @fields = split(/\t/, $top);
+
+    my $ref_file = $fields[0];
+    my $ani      = $fields[2];
+    my $af_query = $fields[4];
+    my $ref_name = $fields[5] // "";
+
+    #
+    # Extract genome_id from the reference file path.
+    # Expected pattern: .../fasta/<genome_id>.fna
+    #
+    my $genome_id;
+    if ($ref_file =~ m{/([^/]+)\.fn[a-z]*$})
+    {
+	$genome_id = $1;
+    }
+    else
+    {
+	die "Cannot parse genome_id from skani reference path: $ref_file\n";
+    }
+
+    print STDERR sprintf("skani top hit: genome=%s ANI=%.2f%% AF=%.2f%% name=%s\n",
+			 $genome_id, $ani, $af_query, $ref_name);
+
+    #
+    # Apply thresholds.
+    #
+    if ($ani < $min_ani || $af_query < $min_af)
+    {
+	die sprintf(
+	    "Cannot determine organism from contigs. " .
+	    "Closest reference: %s (%s) with ANI=%.2f%%, AF=%.2f%%. " .
+	    "Thresholds: ANI>=%.1f%%, AF>=%.1f%%. " .
+	    "Please supply taxonomy_id and scientific_name manually.\n",
+	    $genome_id, $ref_name, $ani, $af_query,
+	    $min_ani, $min_af
+	);
+    }
+
+    #
+    # Look up taxonomy from the mapping file.
+    #
+    my $taxon_info = lookup_genome_taxonomy($genome_id, $taxon_map);
+
+    return {
+	genome_id       => $genome_id,
+	ani             => $ani,
+	af              => $af_query,
+	ref_name        => $ref_name,
+	taxonomy_id     => $taxon_info->{taxon_id},
+	scientific_name => $taxon_info->{scientific_name},
+    };
+}
+
+sub lookup_genome_taxonomy
+{
+    my($genome_id, $taxon_map_file) = @_;
+
+    open(my $fh, "<", $taxon_map_file)
+	or die "Cannot open taxonomy map $taxon_map_file: $!\n";
+
+    my $header = <$fh>;
+    while (<$fh>)
+    {
+	chomp;
+	my @f = split(/\t/);
+	if ($f[0] eq $genome_id)
+	{
+	    close($fh);
+	    return {
+		taxon_id        => $f[1],
+		scientific_name => $f[2],
+	    };
+	}
+    }
+    close($fh);
+
+    die "Genome $genome_id not found in taxonomy map $taxon_map_file\n";
 }

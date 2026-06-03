@@ -17,9 +17,9 @@
     {
       "id": "scientific_name",
       "label": "Scientific Name",
-      "required": 1,
+      "required": 0,
       "default": null,
-      "desc": "Scientific name of genome to be annotated",
+      "desc": "Scientific name of genome to be annotated. If omitted and taxonomy_id is also omitted, will be predicted via skani.",
       "type": "string"
     },
     {
