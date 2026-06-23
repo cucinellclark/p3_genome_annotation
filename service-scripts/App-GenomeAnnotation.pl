@@ -170,6 +170,20 @@ sub process_genome
 	$params->{taxonomy_id}     = $prediction->{taxonomy_id};
 	$params->{scientific_name} //= $prediction->{scientific_name};
 	$params->{_skani_prediction} = $prediction;
+
+	#
+	# Prepend the predicted scientific name to the output_file
+	# so it matches the naming convention used when the user
+	# selects the organism on the frontend.
+	#
+	if ($params->{output_file})
+	{
+	    $params->{output_file} = $params->{scientific_name} . " " . $params->{output_file};
+	}
+	else
+	{
+	    $params->{output_file} = $params->{scientific_name};
+	}
     }
     elsif (!$params->{taxonomy_id})
     {
