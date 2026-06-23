@@ -5,7 +5,7 @@
 
 use Bio::KBase::AppService::AppScript;
 use Bio::P3::GenomeAnnotationApp::GenomeAnnotationCore;
-use Bio::KBase::AppService::AppConfig qw(data_api_url db_host db_user db_pass db_name seedtk);
+use Bio::KBase::AppService::AppConfig qw(data_api_url db_host db_user db_pass db_name seedtk application_backend_dir);
 use Bio::KBase::AppService::FastaParser 'parse_fasta';
 use Bio::KBase::AppService::LongestCommonSubstring qw(BuildString BuildTree LongestCommonSubstring);
 use IPC::Run;
@@ -26,31 +26,25 @@ use GenomeTypeObject;
 
 #
 # skani organism prediction configuration.
-# Loaded from skani_config.json located next to this script,
-# or override with $SKANI_CONFIG environment variable.
+# Database and taxon map are loaded from the application backend directory
+# at /vol/bvbrc/production/application-backend/genome_annotation/skani/current/.
 #
 
-my $skani_config_file = $ENV{SKANI_CONFIG}
-    // dirname(__FILE__) . "/../skani_config.json";
-my $SKANI_CONFIG = {};
-if (-f $skani_config_file)
+my $skani_data_dir = application_backend_dir . "/genome_annotation/skani/current";
+my $SKANI_DB       = "$skani_data_dir/bvbrc_ref_sketches";
+my $SKANI_TAXON_MAP = "$skani_data_dir/genome_taxon_map.tsv";
+my $SKANI_MIN_ANI  = 80.0;
+my $SKANI_MIN_AF   = 30.0;
+my $SKANI_THREADS  = 8;
+
+my $skani_enabled = -d $SKANI_DB;
+if ($skani_enabled)
 {
-    eval {
-	open(my $fh, "<", $skani_config_file) or die "Cannot open $skani_config_file: $!";
-	local $/;
-	my $text = <$fh>;
-	close($fh);
-	$SKANI_CONFIG = JSON::XS::decode_json($text);
-	print STDERR "Loaded skani config from $skani_config_file\n";
-    };
-    if ($@)
-    {
-	warn "Warning: failed to load skani config from $skani_config_file: $@\n";
-    }
+    print STDERR "skani organism prediction enabled; database at $SKANI_DB\n";
 }
 else
 {
-    print STDERR "No skani config found at $skani_config_file; organism prediction disabled\n";
+    print STDERR "skani database not found at $SKANI_DB; organism prediction disabled\n";
 }
 
 my $script = Bio::KBase::AppService::AppScript->new(\&process_genome, \&preflight);
@@ -136,7 +130,7 @@ sub process_genome
     # If taxonomy_id was not provided, run skani organism prediction.
     # We need the contigs downloaded to a local temp file first.
     #
-    if (!$params->{taxonomy_id} && $SKANI_CONFIG->{skani_db})
+    if (!$params->{taxonomy_id} && $skani_enabled)
     {
 	print STDERR "No taxonomy_id supplied; running skani organism prediction\n";
 
@@ -535,21 +529,15 @@ sub run_skani_prediction
 {
     my($contig_file) = @_;
 
-    my $skani_db   = $SKANI_CONFIG->{skani_db}   or die "skani_db not set in skani config\n";
-    my $taxon_map  = $SKANI_CONFIG->{taxon_map}  or die "taxon_map not set in skani config\n";
-    my $min_ani    = $SKANI_CONFIG->{min_ani}    // 80.0;
-    my $min_af     = $SKANI_CONFIG->{min_af}     // 30.0;
-    my $threads    = $SKANI_CONFIG->{threads}    // 8;
-
     print STDERR "Running skani organism prediction on $contig_file\n";
-    print STDERR "  Database: $skani_db\n";
-    print STDERR "  Thresholds: ANI >= $min_ani%, AF >= $min_af%\n";
+    print STDERR "  Database: $SKANI_DB\n";
+    print STDERR "  Thresholds: ANI >= $SKANI_MIN_ANI%, AF >= $SKANI_MIN_AF%\n";
 
     my @cmd = ("skani", "search",
 	       "--qi", $contig_file,
-	       "-d", $skani_db,
+	       "-d", $SKANI_DB,
 	       "-n", "1",
-	       "-t", $threads);
+	       "-t", $SKANI_THREADS);
 
     my ($out, $err);
     my $ok = IPC::Run::run(\@cmd, ">", \$out, "2>", \$err);
@@ -601,7 +589,7 @@ sub run_skani_prediction
     #
     # Apply thresholds.
     #
-    if ($ani < $min_ani || $af_query < $min_af)
+    if ($ani < $SKANI_MIN_ANI || $af_query < $SKANI_MIN_AF)
     {
 	die sprintf(
 	    "Cannot determine organism from contigs. " .
@@ -609,14 +597,14 @@ sub run_skani_prediction
 	    "Thresholds: ANI>=%.1f%%, AF>=%.1f%%. " .
 	    "Please supply taxonomy_id and scientific_name manually.\n",
 	    $genome_id, $ref_name, $ani, $af_query,
-	    $min_ani, $min_af
+	    $SKANI_MIN_ANI, $SKANI_MIN_AF
 	);
     }
 
     #
     # Look up taxonomy from the mapping file.
     #
-    my $taxon_info = lookup_genome_taxonomy($genome_id, $taxon_map);
+    my $taxon_info = lookup_genome_taxonomy($genome_id, $SKANI_TAXON_MAP);
 
     return {
 	genome_id       => $genome_id,
